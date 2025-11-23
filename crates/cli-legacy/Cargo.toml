@@ -18,7 +18,9 @@ clap_derive = "4.5.0"
 indicatif = "0.17.11"
 colored = "3.0.0"
 image = "0.25.5"
+png = "0.17"
 crossbeam-channel = "0.5.15"
+indexmap.workspace = true
 
 [[bin]]
 name = "kfc-parser"

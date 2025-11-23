@@ -9,11 +9,13 @@ use kfc::guid::{ContentHash, ResourceId};
 use kfc::reflection::{LookupKey, TypeRegistry};
 use kfc::content::impact::bytecode::{ImpactAssembler, ImpactProgramData};
 use kfc::content::impact::{ImpactProgram, TypeRegistryImpactExt};
+use kfc::content::image::{PixelFormat, decode as decode_image};
+use kfc::content::audio::deserialize_audio;
 use thiserror::Error;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env::current_exe;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -118,12 +120,14 @@ fn main() {
             file_name,
             output,
             filter,
+            convert,
         } => {
             extract_content(
                 &game_directory,
                 file_name.as_deref(),
                 &output,
                 filter,
+                convert,
                 thread_count
             )
         }
@@ -1403,11 +1407,264 @@ fn dump_types_to_path(
     Ok(())
 }
 
+/// Content metadata extracted from resources
+#[derive(Debug, Clone)]
+enum ContentMetadata {
+    Image {
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    },
+    Audio {
+        channels: u16,
+        sample_rate: u32,
+        frame_count: u32,
+    },
+}
+
+/// Recursively scan a Value for ContentHash fields and extract associated metadata
+fn scan_value_for_content(
+    value: &Value,
+    parent_struct: Option<&indexmap::IndexMap<String, Value>>,
+    content_map: &mut HashMap<ContentHash, ContentMetadata>,
+) {
+    match value {
+        Value::Guid(guid) => {
+            // Check if this is a ContentHash with metadata in parent struct
+            if let Some(parent) = parent_struct {
+                let content_hash = ContentHash::from_guid(*guid);
+                if content_hash.is_none() {
+                    return;
+                }
+
+                // Check for image metadata (width, height, format)
+                let width = parent.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let height = parent.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let format = parent.get("format").and_then(|v| v.as_u64()).map(|v| v as u32);
+
+                if let (Some(w), Some(h), Some(f)) = (width, height, format) {
+                    if w > 0 && h > 0 {
+                        // Convert format number to PixelFormat enum
+                        if let Some(pixel_format) = pixel_format_from_u32(f) {
+                            content_map.insert(content_hash, ContentMetadata::Image {
+                                width: w,
+                                height: h,
+                                format: pixel_format,
+                            });
+                            return;
+                        }
+                    }
+                }
+
+                // Check for audio metadata (channels, sampleRate, frameCount)
+                let channels = parent.get("channels")
+                    .or_else(|| parent.get("channelCount"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u16);
+                let sample_rate = parent.get("sampleRate")
+                    .or_else(|| parent.get("sample_rate"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let frame_count = parent.get("frameCount")
+                    .or_else(|| parent.get("frame_count"))
+                    .or_else(|| parent.get("sampleCount"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+
+                if let (Some(ch), Some(sr), Some(fc)) = (channels, sample_rate, frame_count) {
+                    if ch > 0 && sr > 0 && fc > 0 {
+                        content_map.insert(content_hash, ContentMetadata::Audio {
+                            channels: ch,
+                            sample_rate: sr,
+                            frame_count: fc,
+                        });
+                    }
+                }
+            }
+        }
+        Value::Struct(fields) => {
+            // Scan each field, passing the struct as parent context
+            for (_, field_value) in fields.iter() {
+                scan_value_for_content(field_value, Some(fields), content_map);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scan_value_for_content(item, None, content_map);
+            }
+        }
+        Value::Variant(variant) => {
+            for (_, field_value) in variant.value.iter() {
+                scan_value_for_content(field_value, Some(&variant.value), content_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert u32 to PixelFormat enum
+fn pixel_format_from_u32(value: u32) -> Option<PixelFormat> {
+    // The PixelFormat enum values correspond to their ordinal position
+    // This is a simplified approach - in practice we'd need the exact mapping
+    let formats = [
+        PixelFormat::None,
+        PixelFormat::R4G4_unorm_pack8,
+        PixelFormat::R4G4B4A4_unorm_pack16,
+        PixelFormat::B4G4R4A4_unorm_pack16,
+        PixelFormat::R5G6B5_unorm_pack16,
+        PixelFormat::B5G6R5_unorm_pack16,
+        PixelFormat::R5G5B5A1_unorm_pack16,
+        PixelFormat::B5G5R5A1_unorm_pack16,
+        PixelFormat::A1R5G5B5_unorm_pack16,
+        PixelFormat::R8_unorm,
+        PixelFormat::R8_snorm,
+        PixelFormat::R8_uscaled,
+        PixelFormat::R8_sscaled,
+        PixelFormat::R8_uint,
+        PixelFormat::R8_sint,
+        PixelFormat::R8_srgb,
+        PixelFormat::R8G8_unorm,
+        PixelFormat::R8G8_snorm,
+        PixelFormat::R8G8_uscaled,
+        PixelFormat::R8G8_sscaled,
+        PixelFormat::R8G8_uint,
+        PixelFormat::R8G8_sint,
+        PixelFormat::R8G8_srgb,
+        PixelFormat::R8G8B8_unorm,
+        PixelFormat::R8G8B8_snorm,
+        PixelFormat::R8G8B8_uscaled,
+        PixelFormat::R8G8B8_sscaled,
+        PixelFormat::R8G8B8_uint,
+        PixelFormat::R8G8B8_sint,
+        PixelFormat::R8G8B8_srgb,
+        PixelFormat::B8G8R8_unorm,
+        PixelFormat::B8G8R8_snorm,
+        PixelFormat::B8G8R8_uscaled,
+        PixelFormat::B8G8R8_sscaled,
+        PixelFormat::B8G8R8_uint,
+        PixelFormat::B8G8R8_sint,
+        PixelFormat::B8G8R8_srgb,
+        PixelFormat::R8G8B8A8_unorm,
+        PixelFormat::R8G8B8A8_snorm,
+        PixelFormat::R8G8B8A8_uscaled,
+        PixelFormat::R8G8B8A8_sscaled,
+        PixelFormat::R8G8B8A8_uint,
+        PixelFormat::R8G8B8A8_sint,
+        PixelFormat::R8G8B8A8_srgb,
+        PixelFormat::B8G8R8A8_unorm,
+        PixelFormat::B8G8R8A8_snorm,
+        PixelFormat::B8G8R8A8_uscaled,
+        PixelFormat::B8G8R8A8_sscaled,
+        PixelFormat::B8G8R8A8_uint,
+        PixelFormat::B8G8R8A8_sint,
+        PixelFormat::B8G8R8A8_srgb,
+        PixelFormat::A8B8G8R8_unorm_pack32,
+        PixelFormat::A8B8G8R8_snorm_pack32,
+        PixelFormat::A8B8G8R8_uscaled_pack32,
+        PixelFormat::A8B8G8R8_sscaled_pack32,
+        PixelFormat::A8B8G8R8_uint_pack32,
+        PixelFormat::A8B8G8R8_sint_pack32,
+        PixelFormat::A8B8G8R8_srgb_pack32,
+        PixelFormat::A2R10G10B10_unorm_pack32,
+        PixelFormat::A2R10G10B10_snorm_pack32,
+        PixelFormat::A2R10G10B10_uscaled_pack32,
+        PixelFormat::A2R10G10B10_sscaled_pack32,
+        PixelFormat::A2R10G10B10_uint_pack32,
+        PixelFormat::A2R10G10B10_sint_pack32,
+        PixelFormat::A2B10G10R10_unorm_pack32,
+        PixelFormat::A2B10G10R10_snorm_pack32,
+        PixelFormat::A2B10G10R10_uscaled_pack32,
+        PixelFormat::A2B10G10R10_sscaled_pack32,
+        PixelFormat::A2B10G10R10_uint_pack32,
+        PixelFormat::A2B10G10R10_sint_pack32,
+        PixelFormat::R16_unorm,
+        PixelFormat::R16_snorm,
+        PixelFormat::R16_uscaled,
+        PixelFormat::R16_sscaled,
+        PixelFormat::R16_uint,
+        PixelFormat::R16_sint,
+        PixelFormat::R16_sfloat,
+        PixelFormat::R16G16_unorm,
+        PixelFormat::R16G16_snorm,
+        PixelFormat::R16G16_uscaled,
+        PixelFormat::R16G16_sscaled,
+        PixelFormat::R16G16_uint,
+        PixelFormat::R16G16_sint,
+        PixelFormat::R16G16_sfloat,
+        PixelFormat::R16G16B16_unorm,
+        PixelFormat::R16G16B16_snorm,
+        PixelFormat::R16G16B16_uscaled,
+        PixelFormat::R16G16B16_sscaled,
+        PixelFormat::R16G16B16_uint,
+        PixelFormat::R16G16B16_sint,
+        PixelFormat::R16G16B16_sfloat,
+        PixelFormat::R16G16B16A16_unorm,
+        PixelFormat::R16G16B16A16_snorm,
+        PixelFormat::R16G16B16A16_uscaled,
+        PixelFormat::R16G16B16A16_sscaled,
+        PixelFormat::R16G16B16A16_uint,
+        PixelFormat::R16G16B16A16_sint,
+        PixelFormat::R16G16B16A16_sfloat,
+        PixelFormat::R32_uint,
+        PixelFormat::R32_sint,
+        PixelFormat::R32_sfloat,
+        PixelFormat::R32G32_uint,
+        PixelFormat::R32G32_sint,
+        PixelFormat::R32G32_sfloat,
+        PixelFormat::R32G32B32_uint,
+        PixelFormat::R32G32B32_sint,
+        PixelFormat::R32G32B32_sfloat,
+        PixelFormat::R32G32B32A32_uint,
+        PixelFormat::R32G32B32A32_sint,
+        PixelFormat::R32G32B32A32_sfloat,
+        PixelFormat::R64_uint,
+        PixelFormat::R64_sint,
+        PixelFormat::R64_sfloat,
+        PixelFormat::R64G64_uint,
+        PixelFormat::R64G64_sint,
+        PixelFormat::R64G64_sfloat,
+        PixelFormat::R64G64B64_uint,
+        PixelFormat::R64G64B64_sint,
+        PixelFormat::R64G64B64_sfloat,
+        PixelFormat::R64G64B64A64_uint,
+        PixelFormat::R64G64B64A64_sint,
+        PixelFormat::R64G64B64A64_sfloat,
+        PixelFormat::B10G11R11_ufloat_pack32,
+        PixelFormat::E5B9G9R9_ufloat_pack32,
+        PixelFormat::D16_unorm,
+        PixelFormat::X8_D24_unorm_pack32,
+        PixelFormat::D32_sfloat,
+        PixelFormat::S8_uint,
+        PixelFormat::D16_unorm_S8_uint,
+        PixelFormat::D24_unorm_S8_uint,
+        PixelFormat::D32_sfloat_S8_uint,
+        PixelFormat::BC1_RGB_unorm_block,
+        PixelFormat::BC1_RGB_srgb_block,
+        PixelFormat::BC1_RGBA_unorm_block,
+        PixelFormat::BC1_RGBA_srgb_block,
+        PixelFormat::BC2_unorm_block,
+        PixelFormat::BC2_srgb_block,
+        PixelFormat::BC3_unorm_block,
+        PixelFormat::BC3_srgb_block,
+        PixelFormat::BC4_unorm_block,
+        PixelFormat::BC4_snorm_block,
+        PixelFormat::BC5_unorm_block,
+        PixelFormat::BC5_snorm_block,
+        PixelFormat::BC6H_ufloat_block,
+        PixelFormat::BC6H_sfloat_block,
+        PixelFormat::BC7_unorm_block,
+        PixelFormat::BC7_srgb_block,
+    ];
+
+    formats.get(value as usize).copied()
+}
+
 fn extract_content(
     game_dir: &Path,
     file_name: Option<&str>,
     output_dir: &Path,
     filter: String,
+    convert: bool,
     thread_count: u8,
 ) -> Result<(), Error> {
     if !game_dir.exists() {
@@ -1420,8 +1677,8 @@ fn extract_content(
         }
     }
 
-    let file_name = get_file_name(game_dir, file_name)?;
-    let file_path = get_file(game_dir, Some(&file_name), "kfc")?;
+    let file_name_str = get_file_name(game_dir, file_name)?;
+    let file_path = get_file(game_dir, Some(&file_name_str), "kfc")?;
 
     let file = match KFCFile::from_path(&file_path, false) {
         Ok(dir) => dir,
@@ -1472,7 +1729,62 @@ fn extract_content(
         }
     }
 
-    let kfc_reader = match KFCReader::new(game_dir, &file_name) {
+    // Build content metadata map if conversion is requested
+    let content_metadata: HashMap<ContentHash, ContentMetadata> = if convert {
+        info!("Scanning resources for content metadata...");
+
+        let type_registry = match load_type_registry(Some(game_dir), file_name, true) {
+            Ok(reg) => reg,
+            Err(e) => {
+                warn!("Failed to load type registry, conversion will be limited: {}", e);
+                TypeRegistry::default()
+            }
+        };
+
+        let kfc_reader = match KFCReader::new(game_dir, &file_name_str) {
+            Ok(reader) => reader,
+            Err(e) => fatal!("Failed to open {}: {}", file_path.display(), e)
+        };
+
+        let mut content_map = HashMap::new();
+        let mut cursor = match kfc_reader.new_cursor() {
+            Ok(c) => c,
+            Err(e) => fatal!("Failed to create cursor: {}", e)
+        };
+
+        // Scan all resources for content references
+        for resource_id in file.resources().keys() {
+            let result: anyhow::Result<()> = (|| {
+                let mut data = Vec::new();
+                if !cursor.read_resource_into(resource_id, &mut data)? {
+                    return Ok(());
+                }
+
+                let type_meta = type_registry.get_by_hash(LookupKey::Qualified(resource_id.type_hash()))
+                    .ok_or_else(|| anyhow::anyhow!("Type not found"))?;
+                let value = Value::from_bytes(&type_registry, type_meta, &data)?;
+                scan_value_for_content(&value, None, &mut content_map);
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                // Silently skip resources that can't be parsed
+                let _ = e;
+            }
+        }
+
+        info!("Found metadata for {} content blobs ({} images, {} audio)",
+            content_map.len(),
+            content_map.values().filter(|m| matches!(m, ContentMetadata::Image { .. })).count(),
+            content_map.values().filter(|m| matches!(m, ContentMetadata::Audio { .. })).count()
+        );
+
+        content_map
+    } else {
+        HashMap::new()
+    };
+
+    let kfc_reader = match KFCReader::new(game_dir, &file_name_str) {
         Ok(reader) => reader,
         Err(e) => fatal!("Failed to open {}: {}", file_path.display(), e)
     };
@@ -1499,6 +1811,7 @@ fn extract_content(
             let output_dir = &output_dir;
             let pb = &pb;
             let kfc_reader = &kfc_reader;
+            let content_metadata = &content_metadata;
 
             let handle = s.spawn(move || {
                 let mut reader = match kfc_reader.new_cursor() {
@@ -1528,12 +1841,64 @@ fn extract_content(
                             anyhow::bail!("Content not found");
                         }
 
-                        // Create filename: content hash as guid string with .bin extension
-                        let file_name = format!("{}.bin", hash);
-                        let path = output_dir.join(&file_name);
+                        // Determine output format based on metadata
+                        let (file_name, output_data) = if convert {
+                            if let Some(metadata) = content_metadata.get(&hash) {
+                                match metadata {
+                                    ContentMetadata::Image { width, height, format } => {
+                                        // Decode GPU format to RGBA8
+                                        let w = *width as usize;
+                                        let h = *height as usize;
+                                        let mut rgba = vec![0u8; w * h * 4];
 
+                                        if let Err(e) = decode_image(*format, w, h, &data, &mut rgba) {
+                                            // Fall back to raw binary if decoding fails
+                                            pb.suspend(|| {
+                                                warn!("Failed to decode image {}: {}, saving as raw", hash, e);
+                                            });
+                                            (format!("{}.bin", hash), data)
+                                        } else {
+                                            // Encode as PNG
+                                            let mut png_data = Vec::new();
+                                            {
+                                                let mut encoder = png::Encoder::new(&mut png_data, w as u32, h as u32);
+                                                encoder.set_color(png::ColorType::Rgba);
+                                                encoder.set_depth(png::BitDepth::Eight);
+                                                let mut writer = encoder.write_header()?;
+                                                writer.write_image_data(&rgba)?;
+                                            }
+                                            (format!("{}.png", hash), png_data)
+                                        }
+                                    }
+                                    ContentMetadata::Audio { channels, sample_rate, frame_count } => {
+                                        // Convert to WAV
+                                        let mut wav_data = Vec::new();
+                                        let cursor = Cursor::new(&data);
+                                        let wav_cursor = Cursor::new(&mut wav_data);
+
+                                        if let Err(e) = deserialize_audio(cursor, wav_cursor, *channels, *sample_rate, *frame_count) {
+                                            // Fall back to raw binary if conversion fails
+                                            pb.suspend(|| {
+                                                warn!("Failed to convert audio {}: {}, saving as raw", hash, e);
+                                            });
+                                            (format!("{}.bin", hash), data)
+                                        } else {
+                                            (format!("{}.wav", hash), wav_data)
+                                        }
+                                    }
+                                }
+                            } else {
+                                // No metadata, save as raw binary
+                                (format!("{}.bin", hash), data)
+                            }
+                        } else {
+                            // No conversion, save as raw binary
+                            (format!("{}.bin", hash), data)
+                        };
+
+                        let path = output_dir.join(&file_name);
                         let mut file = File::create(&path)?;
-                        file.write_all(&data)?;
+                        file.write_all(&output_data)?;
 
                         Ok(())
                     })();

@@ -99,6 +99,11 @@ pub enum Commands {
         /// Comma separated filter by content hash (guid format)
         #[arg(short, long, default_value = "*")]
         filter: String,
+
+        /// Convert content to standard formats (PNG for images, WAV for audio)
+        /// This requires scanning resources to determine content types
+        #[arg(short, long, default_value = "false")]
+        convert: bool,
     },
 
     /// Import content blobs back into KFC files
