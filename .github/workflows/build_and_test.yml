@@ -2,6 +2,7 @@ name: Rust Build and Test
 
 on:
   push:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
