@@ -5,12 +5,13 @@ use crate::Hash32;
 
 use super::{KFCReadError, KFCWriteError};
 
-const KFC_DIR_MAGIC: u32 = 0x3243464B; // KFC2
+const KFC_DIR_MAGIC_V2: u32 = 0x3243464B; // KFC2
+const KFC_DIR_MAGIC_V3: u32 = 0x3343464B; // KFC3
 
 /// # Layout
 /// ```c
 /// struct KFCHeader {
-///     u32 magic; // KFC_DIR_MAGIC
+///     u32 magic; // KFC_DIR_MAGIC_V2 or KFC_DIR_MAGIC_V3
 ///     u32 size;
 ///     u32 unk0; // 12
 ///     u8 padding[4];
@@ -39,6 +40,7 @@ const KFC_DIR_MAGIC: u32 = 0x3243464B; // KFC2
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct KFCHeader {
+    pub magic: u32,
     pub size: u64,
     // pub unk0: u32,
 
@@ -69,7 +71,7 @@ impl KFCHeader {
     pub fn read<R: Read + Seek>(reader: &mut R) -> Result<Self, KFCReadError> {
         let magic = reader.read_u32()?;
 
-        if magic != KFC_DIR_MAGIC {
+        if magic != KFC_DIR_MAGIC_V2 && magic != KFC_DIR_MAGIC_V3 {
             return Err(KFCReadError::InvalidMagic(magic));
         }
 
@@ -100,6 +102,7 @@ impl KFCHeader {
         let group_infos = KFCLocation::read(reader)?;
 
         Ok(Self {
+            magic,
             size,
 
             version,
@@ -130,7 +133,9 @@ impl KFCHeader {
             return Err(KFCWriteError::SizeTooLarge(self.size));
         }
 
-        writer.write_u32(KFC_DIR_MAGIC)?;
+        // Write back the same magic that was read (preserve KFC2 vs KFC3)
+        let magic = if self.magic == 0 { KFC_DIR_MAGIC_V3 } else { self.magic };
+        writer.write_u32(magic)?;
         writer.write_u32(self.size as u32)?;
         writer.write_u32(12)?;
         writer.padding(4)?;
