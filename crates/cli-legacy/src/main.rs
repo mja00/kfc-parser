@@ -1753,7 +1753,14 @@ fn extract_content(
         };
 
         // Scan all resources for content references
-        for resource_id in file.resources().keys() {
+        let resource_keys: Vec<_> = file.resources().keys().iter().cloned().collect();
+        let scan_pb = ProgressBar::new(resource_keys.len() as u64);
+        scan_pb.set_style(ProgressStyle::default_bar()
+            .template(&format!("{} Scanning... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+            .unwrap()
+            .progress_chars("##-"));
+
+        for resource_id in &resource_keys {
             let result: anyhow::Result<()> = (|| {
                 let mut data = Vec::new();
                 if !cursor.read_resource_into(resource_id, &mut data)? {
@@ -1771,7 +1778,11 @@ fn extract_content(
                 // Silently skip resources that can't be parsed
                 let _ = e;
             }
+
+            scan_pb.inc(1);
         }
+
+        scan_pb.finish_and_clear();
 
         info!("Found metadata for {} content blobs ({} images, {} audio)",
             content_map.len(),
