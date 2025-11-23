@@ -4,19 +4,20 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parser::container::{KFCFile, KFCReader, KFCWriter};
 use parser::data::impact::bytecode::{ImpactAssembler, ImpactProgramData};
 use parser::data::impact::ImpactProgram;
-use parser::guid::DescriptorGuid;
+use parser::guid::{BlobGuid, DescriptorGuid};
 use parser::reflection::{DescriptorNameMapper, TypeCollection, TypeParseError};
 use std::collections::HashSet;
 use std::env::current_exe;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Mutex;
 use walkdir::WalkDir;
 
-use crate::cli::{Cli, CommandImpact, Commands};
+use crate::cli::{Cli, CommandBlob, CommandImpact, Commands};
 use crate::logging::*;
 
 mod cli;
@@ -106,6 +107,36 @@ fn main() {
             }
             CommandImpact::ExtractNodes => {
                 extract_nodes()
+            }
+        }
+        Commands::Blob(blob) => match blob {
+            CommandBlob::Unpack {
+                game_directory,
+                file_name,
+                output,
+                convert_images,
+                convert_audio,
+            } => {
+                unpack_blobs(
+                    &game_directory,
+                    file_name.as_deref(),
+                    &output,
+                    convert_images,
+                    convert_audio,
+                    thread_count
+                )
+            }
+            CommandBlob::Repack {
+                game_directory,
+                file_name,
+                input,
+            } => {
+                repack_blobs(
+                    &game_directory,
+                    file_name.as_deref(),
+                    &input,
+                    thread_count
+                )
             }
         }
     };
@@ -1276,6 +1307,395 @@ fn extract_nodes() -> Result<(), Error> {
     }
 
     info!("Impact node data has been written to {}", std::path::absolute(output_path).unwrap().display());
+
+    Ok(())
+}
+
+/// Metadata structure for blob files to enable round-trip repacking
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BlobMetadata {
+    /// The blob GUID as a string
+    guid: String,
+    /// Original file size
+    size: u32,
+    /// The file extension/format used for export
+    format: String,
+    /// Original filename (without extension)
+    filename: String,
+}
+
+/// Index file containing all blob metadata for repacking
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BlobIndex {
+    /// Version of the index format
+    version: u32,
+    /// List of all blob metadata entries
+    blobs: Vec<BlobMetadata>,
+}
+
+fn unpack_blobs(
+    game_dir: &Path,
+    file_name: Option<&str>,
+    output_dir: &Path,
+    _convert_images: bool,
+    _convert_audio: bool,
+    thread_count: u8
+) -> Result<(), Error> {
+    if !game_dir.exists() {
+        fatal!("Game directory does not exist: {}", game_dir.display());
+    }
+
+    if !output_dir.exists() {
+        match std::fs::create_dir_all(output_dir) {
+            Ok(()) => {},
+            Err(e) => fatal!("Failed to create output directory: {}", e)
+        }
+    }
+
+    let kfc_file = get_file(game_dir, file_name, "kfc")?;
+    let type_collection = load_type_collection(Some(game_dir), file_name, true)?;
+
+    let file = match KFCFile::from_path(&kfc_file, false) {
+        Ok(dir) => dir,
+        Err(e) => fatal!("Failed to read {}: {}", kfc_file.display(), e)
+    };
+
+    let blob_guids: Vec<&BlobGuid> = file.get_blob_guids().iter().collect();
+
+    if blob_guids.is_empty() {
+        info!("No blobs found to unpack");
+        return Ok(());
+    }
+
+    info!("Unpacking {} blobs to {}", blob_guids.len(), output_dir.display());
+
+    let pb = ProgressBar::new(blob_guids.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template(&format!("{} Unpacking blobs... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+        .unwrap()
+        .progress_chars("##-"));
+
+    let total = blob_guids.len() as u32;
+    let pending_guids = Mutex::new(blob_guids);
+    let failed_unpacks = AtomicU32::new(0);
+    let blob_metadata = Mutex::new(Vec::new());
+    let start = std::time::Instant::now();
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+
+        for i in 0..thread_count {
+            let dir = &file;
+            let failed_unpacks = &failed_unpacks;
+            let pending_guids = &pending_guids;
+            let kfc_file = &kfc_file;
+            let type_collection = &type_collection;
+            let output_dir = &output_dir;
+            let pb = &pb;
+            let blob_metadata = &blob_metadata;
+
+            let handle = s.spawn(move || {
+                let mut buf = Vec::with_capacity(1024 * 1024); // 1MB initial buffer
+                let mut reader = match KFCReader::new(kfc_file, dir, type_collection) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        pb.suspend(|| {
+                            error!("Failed to open {}: {}", kfc_file.display(), e);
+                            error!("Worker #{} has been suspended", i);
+                        });
+                        return;
+                    }
+                };
+
+                loop {
+                    let guid = {
+                        let mut lock = pending_guids.lock().unwrap();
+                        if let Some(entry) = lock.pop() {
+                            entry.clone()
+                        } else {
+                            break;
+                        }
+                    };
+
+                    let result: anyhow::Result<()> = (|| {
+                        buf.clear();
+                        if !reader.read_blob_into(&guid, &mut buf)? {
+                            pb.suspend(|| {
+                                warn!("Skipping blob (not found): {}", guid);
+                            });
+                            return Ok(());
+                        }
+
+                        // Use blob GUID as filename
+                        let filename = guid.to_string();
+                        let format = "bin".to_string();
+                        let file_path = output_dir.join(format!("{}.{}", filename, format));
+
+                        // Write raw blob data
+                        let mut file = match File::create(&file_path) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                pb.suspend(|| {
+                                    error!("Failed to create file `{}`: {}", file_path.display(), e);
+                                });
+                                return Ok(());
+                            }
+                        };
+
+                        std::io::Write::write_all(&mut file, &buf)?;
+
+                        // Record metadata for repacking
+                        let metadata = BlobMetadata {
+                            guid: guid.to_string(),
+                            size: guid.size(),
+                            format: format.clone(),
+                            filename: filename.clone(),
+                        };
+
+                        blob_metadata.lock().unwrap().push(metadata);
+
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            failed_unpacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            pb.suspend(|| {
+                                error!("Error occurred while unpacking blob `{}`: {}", guid, e);
+                            });
+                        }
+                    }
+
+                    pb.inc(1);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap()
+        }
+    });
+
+    pb.finish_and_clear();
+
+    // Write blob index file
+    let index = BlobIndex {
+        version: 1,
+        blobs: blob_metadata.into_inner().unwrap(),
+    };
+
+    let index_path = output_dir.join("blob_index.json");
+    let index_file = match File::create(&index_path) {
+        Ok(file) => file,
+        Err(e) => fatal!("Failed to create blob index file: {}", e)
+    };
+
+    match serde_json::to_writer_pretty(BufWriter::new(index_file), &index) {
+        Ok(()) => {},
+        Err(e) => fatal!("Failed to write blob index file: {}", e)
+    }
+
+    let failed_unpacks = failed_unpacks.load(std::sync::atomic::Ordering::Relaxed);
+    let end = std::time::Instant::now();
+
+    info!("Unpacked a total of {}/{} blobs in {:?}", total - failed_unpacks, total, end - start);
+    info!("Blob index written to {}", index_path.display());
+
+    Ok(())
+}
+
+fn repack_blobs(
+    game_dir: &Path,
+    file_name: Option<&str>,
+    input_dir: &Path,
+    thread_count: u8
+) -> Result<(), Error> {
+    if !game_dir.exists() {
+        fatal!("Game directory does not exist: {}", game_dir.display());
+    }
+
+    if !input_dir.exists() {
+        fatal!("Input directory does not exist: {}", input_dir.display());
+    }
+
+    // Read blob index
+    let index_path = input_dir.join("blob_index.json");
+    if !index_path.exists() {
+        fatal!("Blob index file not found: {}", index_path.display());
+    }
+
+    let index_file = match File::open(&index_path) {
+        Ok(file) => file,
+        Err(e) => fatal!("Failed to open blob index file: {}", e)
+    };
+
+    let index: BlobIndex = match serde_json::from_reader(BufReader::new(index_file)) {
+        Ok(index) => index,
+        Err(e) => fatal!("Failed to parse blob index file: {}", e)
+    };
+
+    if index.blobs.is_empty() {
+        info!("No blobs found to repack");
+        return Ok(());
+    }
+
+    let kfc_path = get_file(game_dir, file_name, "kfc")?;
+    let kfc_path_bak = get_file_opt(game_dir, file_name, "kfc.bak")?;
+
+    if kfc_path_bak.exists() && !validate_backup(&kfc_path, &kfc_path_bak)? {
+        warn!("Backup file is not valid, deleting it...");
+        if let Err(e) = std::fs::remove_file(&kfc_path_bak) {
+            fatal!("Failed to delete backup file: {}", e);
+        }
+    }
+
+    if !kfc_path_bak.exists() {
+        info!("Creating backup of {}...", kfc_path.display());
+        match std::fs::copy(&kfc_path, &kfc_path_bak) {
+            Ok(_) => {},
+            Err(e) => fatal!("Failed to create backup: {}", e)
+        }
+    }
+
+    let type_collection = load_type_collection(Some(game_dir), file_name, true)?;
+
+    let ref_kfc_file = match KFCFile::from_path(&kfc_path_bak, false) {
+        Ok(file) => file,
+        Err(e) => fatal!("Failed to read {}: {}", kfc_path_bak.display(), e)
+    };
+
+    info!("Repacking {} blobs to {}", index.blobs.len(), kfc_path.display());
+
+    let pb = ProgressBar::new(index.blobs.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template(&format!("{} Repacking blobs... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+        .unwrap()
+        .progress_chars("##-"));
+
+    let total = index.blobs.len() as u32;
+    let pending_blobs = Mutex::new(index.blobs);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(BlobGuid, Vec<u8>)>(1024);
+    let failed_repacks = AtomicU32::new(0);
+    let start = std::time::Instant::now();
+
+    let result = std::thread::scope(|s| {
+        let failed_repacks = &failed_repacks;
+        let pending_blobs = &pending_blobs;
+        let pb = &pb;
+        let input_dir = &input_dir;
+
+        let mut handles = Vec::new();
+
+        // Reader threads
+        for _ in 0..thread_count {
+            let tx = tx.clone();
+
+            let handle = s.spawn(move || {
+                loop {
+                    let metadata = {
+                        let mut lock = pending_blobs.lock().unwrap();
+                        if let Some(entry) = lock.pop() {
+                            entry
+                        } else {
+                            break;
+                        }
+                    };
+
+                    let result: anyhow::Result<()> = (|| {
+                        // Parse the blob GUID
+                        let guid = BlobGuid::from_str(&metadata.guid)
+                            .map_err(|e| anyhow::anyhow!("Invalid blob GUID: {}", e))?;
+
+                        // Read the blob file
+                        let file_path = input_dir.join(format!("{}.{}", metadata.filename, metadata.format));
+                        let data = std::fs::read(&file_path)?;
+
+                        // Verify size matches
+                        if data.len() as u32 != guid.size() {
+                            return Err(anyhow::anyhow!(
+                                "Blob size mismatch for {}: expected {}, got {}",
+                                metadata.guid, guid.size(), data.len()
+                            ));
+                        }
+
+                        tx.send((guid, data)).unwrap();
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            failed_repacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            pb.suspend(|| {
+                                error!("Error occurred while reading blob `{}`: {}", metadata.guid, e);
+                            });
+                        }
+                    }
+
+                    pb.inc(1);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        drop(tx);
+
+        // Writer thread
+        let writer_handle = s.spawn(move || {
+            let mut writer = match KFCWriter::new(&kfc_path, &ref_kfc_file, &type_collection) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    error!("Failed to open {}: {}", kfc_path.display(), e);
+                    return Err(Error(format!("Failed to open {}: {}", kfc_path.display(), e)));
+                }
+            };
+
+            while let Ok((guid, data)) = rx.recv() {
+                match writer.write_blob(&guid, &data) {
+                    Ok(()) => {},
+                    Err(e) => {
+                        failed_repacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        error!("Error occurred while writing blob `{}`: {}", guid, e);
+                    }
+                }
+            }
+
+            match writer.finalize() {
+                Ok(()) => Ok(()),
+                Err(e) => Err(Error(format!("Failed to finalize KFC file: {}", e)))
+            }
+        });
+
+        for handle in handles {
+            handle.join().unwrap()
+        }
+
+        match writer_handle.join() {
+            Ok(result) => result,
+            Err(e) => {
+                fatal!("Writer thread panicked: {:?}", e)
+            }
+        }
+    });
+
+    pb.finish_and_clear();
+
+    match result {
+        Ok(()) => {},
+        Err(e) => {
+            error!("{}", e);
+            return revert_repack(game_dir, file_name, true);
+        }
+    }
+
+    let failed_repacks = failed_repacks.load(std::sync::atomic::Ordering::Relaxed);
+    let end = std::time::Instant::now();
+
+    info!("Repacked a total of {}/{} blobs in {:?}", total - failed_repacks, total, end - start);
 
     Ok(())
 }

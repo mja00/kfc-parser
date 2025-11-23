@@ -81,6 +81,51 @@ pub enum Commands {
     /// CLI for impact files
     #[command(subcommand)]
     Impact(CommandImpact),
+
+    /// CLI for blob files (images, sounds, etc.)
+    #[command(subcommand)]
+    Blob(CommandBlob),
+}
+
+#[derive(Subcommand)]
+pub enum CommandBlob {
+    /// Unpack blob files (images, sounds, etc.)
+    Unpack {
+        /// Game directory (should contain enshrouded.kfc and enshrouded._XXX.dat files)
+        #[arg(short, long)]
+        game_directory: PathBuf,
+
+        /// File name override (defaults to `enshrouded` and `enshrouded_server`)
+        #[arg(long)]
+        file_name: Option<String>,
+
+        /// Output directory for unpacked blobs
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Convert images to PNG format where possible
+        #[arg(long, default_value = "false")]
+        convert_images: bool,
+
+        /// Convert audio to WAV format where possible
+        #[arg(long, default_value = "false")]
+        convert_audio: bool,
+    },
+
+    /// Repack blob files back into the game format
+    Repack {
+        /// Game directory (should contain enshrouded.kfc and enshrouded._XXX.dat files)
+        #[arg(short, long)]
+        game_directory: PathBuf,
+
+        /// File name override (defaults to `enshrouded` and `enshrouded_server`)
+        #[arg(long)]
+        file_name: Option<String>,
+
+        /// Input directory containing unpacked blob files and metadata
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

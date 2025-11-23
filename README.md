@@ -5,6 +5,7 @@ Parser for unpacking and repacking Enshrouded game files.
 ## Features
 
 - Unpacking and repacking (1:1) all types of descriptor files.
+- Unpacking and repacking of blob files (images, sounds, etc.).
 - Extracting reflection data from the enshrouded executable. (Only windows x64)
 - Disassembling and assembling of impact programs.
 
@@ -60,6 +61,36 @@ The `input-file-name` should be the shared name of the disassembled files as fol
 kfc-parser.exe impact assemble -i <input-file-name> [OPTIONS]
 ```
 
+### Blob CLI
+
+The `blob` sub command can be used to unpack and repack blob files (raw binary data such as images, sounds, etc.).
+
+#### Unpacking Blobs
+
+To unpack blob files from the game, use the `blob unpack` command:
+
+```sh
+kfc-parser.exe blob unpack -g <game-dir> -o <output-dir>
+```
+
+This will:
+- Extract all blob files as raw `.bin` files
+- Create a `blob_index.json` file containing metadata needed for repacking
+
+#### Repacking Blobs
+
+To repack blob files back into the game format, use the `blob repack` command:
+
+```sh
+kfc-parser.exe blob repack -g <game-dir> -i <input-dir>
+```
+
+The input directory must contain the `blob_index.json` file created during unpacking.
+
+**Note:** Blob files are raw binary data. The blob GUID encodes the file size, so modified
+blobs must maintain the exact same size as the original. If you need to modify blob content,
+you can edit the `.bin` files directly but must not change their size.
+
 ### Extracting Reflection Data
 
 To extract reflection data from the enshrouded executable, use the `extract-types` command.
@@ -69,7 +100,3 @@ To extract reflection data from the enshrouded executable, use the `extract-type
 ```sh
 kfc-parser.exe extract-types [OPTIONS]
 ```
-
-## TODO
-
-- Implement unpacking/repacking of blob files such as images, sounds, etc.
