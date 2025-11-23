@@ -1353,7 +1353,8 @@ fn unpack_blobs(
     }
 
     let kfc_file = get_file(game_dir, file_name, "kfc")?;
-    let type_collection = load_type_collection(Some(game_dir), file_name, true)?;
+    // Blob operations don't require type information, use empty collection
+    let type_collection = TypeCollection::default();
 
     let file = match KFCFile::from_path(&kfc_file, false) {
         Ok(dir) => dir,
@@ -1560,7 +1561,8 @@ fn repack_blobs(
         }
     }
 
-    let type_collection = load_type_collection(Some(game_dir), file_name, true)?;
+    // Blob operations don't require type information, use empty collection
+    let type_collection = TypeCollection::default();
 
     let ref_kfc_file = match KFCFile::from_path(&kfc_path_bak, false) {
         Ok(file) => file,
