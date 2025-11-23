@@ -5,7 +5,7 @@ use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use kfc::container::{KFCFile, KFCReader, KFCWriter};
 use kfc::resource::value::Value;
-use kfc::guid::ResourceId;
+use kfc::guid::{ContentHash, ResourceId};
 use kfc::reflection::{LookupKey, TypeRegistry};
 use kfc::content::impact::bytecode::{ImpactAssembler, ImpactProgramData};
 use kfc::content::impact::{ImpactProgram, TypeRegistryImpactExt};
@@ -112,6 +112,32 @@ fn main() {
             CommandImpact::ExtractNodes => {
                 extract_nodes()
             }
+        }
+        Commands::ExtractContent {
+            game_directory,
+            file_name,
+            output,
+            filter,
+        } => {
+            extract_content(
+                &game_directory,
+                file_name.as_deref(),
+                &output,
+                filter,
+                thread_count
+            )
+        }
+        Commands::ImportContent {
+            game_directory,
+            file_name,
+            input,
+        } => {
+            import_content(
+                &game_directory,
+                file_name.as_deref(),
+                &input,
+                thread_count
+            )
         }
     };
 
@@ -1373,6 +1399,315 @@ fn dump_types_to_path(
     } else {
         serde_json::to_writer(writer, &type_registry)?;
     }
+
+    Ok(())
+}
+
+fn extract_content(
+    game_dir: &Path,
+    file_name: Option<&str>,
+    output_dir: &Path,
+    filter: String,
+    thread_count: u8,
+) -> Result<(), Error> {
+    if !game_dir.exists() {
+        fatal!("Game directory does not exist: {}", game_dir.display());
+    }
+
+    if !output_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(output_dir) {
+            fatal!("Failed to create output directory: {}", e);
+        }
+    }
+
+    let file_name = get_file_name(game_dir, file_name)?;
+    let file_path = get_file(game_dir, Some(&file_name), "kfc")?;
+
+    let file = match KFCFile::from_path(&file_path, false) {
+        Ok(dir) => dir,
+        Err(e) => fatal!("Failed to read {}: {}", file_path.display(), e)
+    };
+
+    enum Filter {
+        All,
+        ByHash(ContentHash)
+    }
+
+    let mut filters = Vec::new();
+
+    for filter in filter.split(',') {
+        let entry = filter.trim();
+
+        if entry.is_empty() {
+            continue;
+        }
+
+        if entry == "*" {
+            filters.clear();
+            filters.push(Filter::All);
+            break;
+        } else {
+            match ContentHash::parse(entry) {
+                Some(hash) => filters.push(Filter::ByHash(hash)),
+                None => fatal!("`{}` is not a valid content hash", entry),
+            }
+        }
+    }
+
+    let mut hashes = HashSet::new();
+
+    for filter in &filters {
+        match filter {
+            Filter::All => {
+                hashes = file.contents().keys().iter().cloned().collect();
+                break;
+            }
+            Filter::ByHash(hash) => {
+                if file.contents().contains_key(hash) {
+                    hashes.insert(*hash);
+                } else {
+                    fatal!("Content hash not found: {}", hash);
+                }
+            }
+        }
+    }
+
+    let kfc_reader = match KFCReader::new(game_dir, &file_name) {
+        Ok(reader) => reader,
+        Err(e) => fatal!("Failed to open {}: {}", file_path.display(), e)
+    };
+
+    info!("Extracting {} content blobs to {}", hashes.len(), output_dir.display());
+
+    let pb = ProgressBar::new(hashes.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template(&format!("{} Extracting... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+        .unwrap()
+        .progress_chars("##-"));
+
+    let total = hashes.len() as u32;
+    let pending_hashes = Mutex::new(hashes.into_iter().collect::<Vec<_>>());
+    let failed_extracts = AtomicU32::new(0);
+    let start = std::time::Instant::now();
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+
+        for i in 0..thread_count {
+            let failed_extracts = &failed_extracts;
+            let pending_hashes = &pending_hashes;
+            let output_dir = &output_dir;
+            let pb = &pb;
+            let kfc_reader = &kfc_reader;
+
+            let handle = s.spawn(move || {
+                let mut reader = match kfc_reader.new_cursor() {
+                    Ok(cursor) => cursor,
+                    Err(e) => {
+                        pb.suspend(|| {
+                            error!("Failed to open reader: {}", e);
+                            error!("Worker #{} has been suspended", i);
+                        });
+                        return;
+                    }
+                };
+
+                loop {
+                    let hash = {
+                        let mut lock = pending_hashes.lock().unwrap();
+                        if let Some(entry) = lock.pop() {
+                            entry
+                        } else {
+                            break;
+                        }
+                    };
+
+                    let result: anyhow::Result<()> = (|| {
+                        let mut data = Vec::new();
+                        if !reader.read_content_into(&hash, &mut data)? {
+                            anyhow::bail!("Content not found");
+                        }
+
+                        // Create filename: content hash as guid string with .bin extension
+                        let file_name = format!("{}.bin", hash);
+                        let path = output_dir.join(&file_name);
+
+                        let mut file = File::create(&path)?;
+                        file.write_all(&data)?;
+
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            failed_extracts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            pb.suspend(|| {
+                                error!("Error extracting content `{}`: {}", hash, e);
+                            });
+                        }
+                    }
+
+                    pb.inc(1);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap()
+        }
+    });
+
+    pb.finish_and_clear();
+
+    let failed_extracts = failed_extracts.load(std::sync::atomic::Ordering::Relaxed);
+    let end = std::time::Instant::now();
+
+    info!("Extracted a total of {}/{} content blobs in {:?}", total - failed_extracts, total, end - start);
+
+    Ok(())
+}
+
+fn import_content(
+    game_dir: &Path,
+    file_name: Option<&str>,
+    input_dir: &Path,
+    _thread_count: u8,
+) -> Result<(), Error> {
+    if !game_dir.exists() {
+        fatal!("Game directory does not exist: {}", game_dir.display());
+    }
+
+    if !input_dir.exists() {
+        fatal!("Input directory does not exist: {}", input_dir.display());
+    }
+
+    let kfc_path = get_file(game_dir, file_name, "kfc")?;
+    let kfc_path_bak = get_file_opt(game_dir, file_name, "kfc.bak")?;
+
+    if kfc_path_bak.exists() && !validate_backup(&kfc_path, &kfc_path_bak)? {
+        warn!("Backup file is not valid, deleting it...");
+
+        if !kfc_path_bak.is_file() {
+            fatal!("Backup path is not a file, please remove it manually: {}", kfc_path_bak.display())
+        }
+
+        if let Err(e) = std::fs::remove_file(&kfc_path_bak) {
+            fatal!("Failed to delete backup file: {}", e);
+        }
+    }
+
+    if !kfc_path_bak.exists() {
+        info!("Creating backup of {}...", kfc_path.display());
+
+        match std::fs::copy(&kfc_path, &kfc_path_bak) {
+            Ok(_) => {},
+            Err(e) => fatal!("Failed to create backup: {}", e)
+        }
+    }
+
+    let type_registry = load_type_registry(Some(game_dir), file_name, true)?;
+
+    let mut ref_kfc_file = match KFCFile::from_path(&kfc_path_bak, false) {
+        Ok(file) => file,
+        Err(e) => fatal!("Failed to read {}: {}", kfc_path_bak.display(), e)
+    };
+
+    // Collect .bin files from input directory
+    let files: Vec<PathBuf> = WalkDir::new(input_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if files.is_empty() {
+        fatal!("No .bin files found in input directory");
+    }
+
+    info!("Importing {} content blobs from {}", files.len(), input_dir.display());
+
+    let file_name_str = get_file_name(game_dir, file_name)?;
+
+    let mut writer = match KFCWriter::new_incremental(
+        game_dir,
+        &file_name_str,
+        &mut ref_kfc_file,
+        &type_registry
+    ) {
+        Ok(writer) => writer,
+        Err(e) => fatal!("Failed to open writer: {}", e)
+    };
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template(&format!("{} Importing... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+        .unwrap()
+        .progress_chars("##-"));
+
+    let total = files.len() as u32;
+    let failed_imports = AtomicU32::new(0);
+    let start = std::time::Instant::now();
+
+    for file_path in &files {
+        let result: anyhow::Result<()> = (|| {
+            // Parse content hash from filename (without .bin extension)
+            let stem = file_path.file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
+            // Read the content data
+            let data = std::fs::read(file_path)?;
+
+            // Generate content hash from data
+            let content_hash = ContentHash::from_data(&data);
+
+            // Optionally verify it matches the filename (if filename is a valid hash)
+            if let Some(expected_hash) = ContentHash::parse(stem) {
+                if expected_hash != content_hash {
+                    warn!("Content hash mismatch for {}: expected {}, got {}",
+                        file_path.display(), expected_hash, content_hash);
+                }
+            }
+
+            // Write the content
+            writer.write_content(&content_hash, &data)?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {},
+            Err(e) => {
+                failed_imports.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                pb.suspend(|| {
+                    error!("Error importing content `{}`: {}", file_path.display(), e);
+                });
+            }
+        }
+
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+
+    match writer.finalize() {
+        Ok(()) => {},
+        Err(e) => {
+            error!("Failed to finalize writer: {}", e);
+            return revert_repack(game_dir, file_name, true);
+        }
+    }
+
+    let failed_imports = failed_imports.load(std::sync::atomic::Ordering::Relaxed);
+    let end = std::time::Instant::now();
+
+    info!("Imported a total of {}/{} content blobs in {:?}", total - failed_imports, total, end - start);
 
     Ok(())
 }
