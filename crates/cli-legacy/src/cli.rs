@@ -81,6 +81,45 @@ pub enum Commands {
     /// CLI for impact files
     #[command(subcommand)]
     Impact(CommandImpact),
+
+    /// Extract content blobs (images, audio, etc.) from KFC files
+    ExtractContent {
+        /// Game directory (should contain enshrouded.kfc and enshrouded._XXX.dat files)
+        #[arg(short, long)]
+        game_directory: PathBuf,
+
+        /// File name override (defaults to `enshrouded` and `enshrouded_server`)
+        #[arg(long)]
+        file_name: Option<String>,
+
+        /// Output directory for extracted content files
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Comma separated filter by content hash (guid format)
+        #[arg(short, long, default_value = "*")]
+        filter: String,
+
+        /// Convert content to standard formats (PNG for images, WAV for audio)
+        /// This requires scanning resources to determine content types
+        #[arg(short, long, default_value = "false")]
+        convert: bool,
+    },
+
+    /// Import content blobs back into KFC files
+    ImportContent {
+        /// Game directory (should contain enshrouded.kfc and enshrouded._XXX.dat files)
+        #[arg(short, long)]
+        game_directory: PathBuf,
+
+        /// File name override (defaults to `enshrouded` and `enshrouded_server`)
+        #[arg(long)]
+        file_name: Option<String>,
+
+        /// Input directory containing content files to import
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

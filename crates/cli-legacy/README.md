@@ -57,6 +57,40 @@ The `input-file-name` should be the shared name of the disassembled files as fol
 kfc-parser.exe impact assemble -i <input-file-name> [OPTIONS]
 ```
 
+### Extracting and Importing Content Blobs
+
+Content blobs are binary data files (images, audio, etc.) stored in the `.dat` files.
+
+To extract all content blobs to raw `.bin` files, use the `extract-content` command.
+
+```sh
+kfc-parser.exe extract-content -g <game-dir> -o <output-dir> [OPTIONS]
+```
+
+The files are named using their content hash (GUID format) with a `.bin` extension.
+
+#### Converting to Standard Formats
+
+Use the `-c` or `--convert` flag to automatically convert content to standard formats:
+- **Images**: Converted to PNG files (decodes GPU texture formats like BC1-BC7, RGBA8, etc.)
+- **Audio**: Converted to WAV files (16-bit PCM)
+- **Unknown types**: Saved as raw binary `.bin` files
+
+```sh
+kfc-parser.exe extract-content -g <game-dir> -o <output-dir> --convert
+```
+
+This scans all resources to find content metadata (image dimensions, pixel format, audio sample rate, etc.) and uses this information to properly decode the content.
+
+#### Importing Content
+
+To import content blobs back into the KFC files, use the `import-content` command.
+The content hash is automatically computed from the file data.
+
+```sh
+kfc-parser.exe import-content -g <game-dir> -i <input-dir>
+```
+
 ### Extracting Reflection Data
 
 To extract reflection data from the enshrouded executable, use the `extract-types` command.
