@@ -1,10 +1,12 @@
 mod decode;
 mod encode;
 mod format;
+mod wrapper;
 
 pub use decode::*;
 pub use encode::*;
 pub use format::*;
+pub use wrapper::*;
 
 pub fn size_of_format(
     format: PixelFormat,

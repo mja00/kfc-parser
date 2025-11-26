@@ -5,11 +5,11 @@ use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use kfc::container::{KFCFile, KFCReader, KFCWriter};
 use kfc::resource::value::Value;
-use kfc::guid::{ContentHash, ResourceId};
+use kfc::guid::{ContentHash, Guid, ResourceId};
 use kfc::reflection::{LookupKey, TypeRegistry};
 use kfc::content::impact::bytecode::{ImpactAssembler, ImpactProgramData};
 use kfc::content::impact::{ImpactProgram, TypeRegistryImpactExt};
-use kfc::content::image::{PixelFormat, decode as decode_image};
+use kfc::content::image::{PixelFormat, decode as decode_image, strip_content_wrapper, size_of_format};
 use kfc::content::audio::deserialize_audio;
 use thiserror::Error;
 use std::collections::{HashMap, HashSet};
@@ -121,6 +121,11 @@ fn main() {
             output,
             filter,
             convert,
+            organize,
+            use_debug_names,
+            mipmaps,
+            registry,
+            limit,
         } => {
             extract_content(
                 &game_directory,
@@ -128,7 +133,12 @@ fn main() {
                 &output,
                 filter,
                 convert,
-                thread_count
+                organize,
+                use_debug_names,
+                mipmaps,
+                registry.as_deref(),
+                thread_count,
+                limit
             )
         }
         Commands::ImportContent {
@@ -1414,12 +1424,61 @@ enum ContentMetadata {
         width: u32,
         height: u32,
         format: PixelFormat,
+        level_count: u32,
+        debug_name: Option<String>,
     },
     Audio {
         channels: u16,
         sample_rate: u32,
         frame_count: u32,
+        debug_name: Option<String>,
     },
+}
+
+/// Extract ContentHash from a data object with size, hash0, hash1, hash2 fields
+fn extract_content_hash_from_data(data_obj: &indexmap::IndexMap<String, Value>) -> Option<ContentHash> {
+    let size = data_obj.get("size")?.as_u64()? as u32;
+    let hash0 = data_obj.get("hash0")?.as_u64()? as u32;
+    let hash1 = data_obj.get("hash1")?.as_u64()? as u32;
+    let hash2 = data_obj.get("hash2")?.as_u64()? as u32;
+
+    // Construct ContentHash directly from the values
+    Some(ContentHash::new(size, hash0, hash1, hash2))
+}
+
+/// Extract image metadata from a texture object (handles nested structures)
+fn extract_image_metadata(texture_obj: &indexmap::IndexMap<String, Value>) -> Option<(u32, u32, PixelFormat, u32)> {
+    // Try direct width/height fields first
+    let width = texture_obj.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let height = texture_obj.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
+
+    // Try nested size.x/size.y structure
+    let (w, h) = if let (Some(w), Some(h)) = (width, height) {
+        (Some(w), Some(h))
+    } else if let Some(Value::Struct(size_obj)) = texture_obj.get("size") {
+        let w = size_obj.get("x").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let h = size_obj.get("y").and_then(|v| v.as_u64()).map(|v| v as u32);
+        (w, h)
+    } else {
+        (None, None)
+    };
+
+    let format = texture_obj.get("format").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let level_count = texture_obj.get("levelCount")
+        .or_else(|| texture_obj.get("level_count"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(1);
+
+    if let (Some(w), Some(h), Some(f)) = (w, h, format) {
+        if w > 0 && h > 0 {
+            if let Some(pixel_format) = pixel_format_from_u32(f) {
+                return Some((w, h, pixel_format, level_count));
+            }
+        }
+    }
+
+    None
 }
 
 /// Recursively scan a Value for ContentHash fields and extract associated metadata
@@ -1427,75 +1486,182 @@ fn scan_value_for_content(
     value: &Value,
     parent_struct: Option<&indexmap::IndexMap<String, Value>>,
     content_map: &mut HashMap<ContentHash, ContentMetadata>,
+    item_debug_names: Option<&HashMap<Guid, String>>,
 ) {
     match value {
         Value::Guid(guid) => {
-            // Check if this is a ContentHash with metadata in parent struct
-            if let Some(parent) = parent_struct {
-                let content_hash = ContentHash::from_guid(*guid);
-                if content_hash.is_none() {
-                    return;
-                }
+            // Check if this is a ContentHash (not None)
+            let content_hash = ContentHash::from_guid(*guid);
+            if !content_hash.is_none() {
+                // Check if parent has image/audio metadata
+                if let Some(parent) = parent_struct {
+                    // Try to extract image metadata from parent
+                    if let Some((w, h, fmt, level_count)) = extract_image_metadata(parent) {
+                        let debug_name = parent.get("debugName")
+                            .or_else(|| parent.get("debug_name"))
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.clone());
 
-                // Check for image metadata (width, height, format)
-                let width = parent.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let height = parent.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let format = parent.get("format").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        content_map.insert(content_hash, ContentMetadata::Image {
+                            width: w,
+                            height: h,
+                            format: fmt,
+                            level_count,
+                            debug_name,
+                        });
+                        return;
+                    }
 
-                if let (Some(w), Some(h), Some(f)) = (width, height, format) {
-                    if w > 0 && h > 0 {
-                        // Convert format number to PixelFormat enum
-                        if let Some(pixel_format) = pixel_format_from_u32(f) {
-                            content_map.insert(content_hash, ContentMetadata::Image {
-                                width: w,
-                                height: h,
-                                format: pixel_format,
+                    // Try to extract audio metadata
+                    let channels = parent.get("channels")
+                        .or_else(|| parent.get("channelCount"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u16);
+                    let sample_rate = parent.get("sampleRate")
+                        .or_else(|| parent.get("sample_rate"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                    let frame_count = parent.get("frameCount")
+                        .or_else(|| parent.get("frame_count"))
+                        .or_else(|| parent.get("sampleCount"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                    let debug_name = parent.get("debugName")
+                        .or_else(|| parent.get("debug_name"))
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.clone());
+
+                    if let (Some(ch), Some(sr), Some(fc)) = (channels, sample_rate, frame_count) {
+                        if ch > 0 && sr > 0 && fc > 0 {
+                            content_map.insert(content_hash, ContentMetadata::Audio {
+                                channels: ch,
+                                sample_rate: sr,
+                                frame_count: fc,
+                                debug_name,
                             });
                             return;
                         }
                     }
                 }
+            }
+        }
+        Value::Struct(fields) => {
+            // Check for nested texture structures
+            // ItemIconRegistry uses "uiTexture", BuffType uses "icon.texture"
+            let texture_field = fields.get("uiTexture")
+                .or_else(|| fields.get("icon").and_then(|icon| {
+                    if let Value::Struct(icon_struct) = icon {
+                        icon_struct.get("texture")
+                    } else {
+                        None
+                    }
+                }));
 
-                // Check for audio metadata (channels, sampleRate, frameCount)
-                let channels = parent.get("channels")
-                    .or_else(|| parent.get("channelCount"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u16);
-                let sample_rate = parent.get("sampleRate")
-                    .or_else(|| parent.get("sample_rate"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let frame_count = parent.get("frameCount")
-                    .or_else(|| parent.get("frame_count"))
-                    .or_else(|| parent.get("sampleCount"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+            if let Some(Value::Struct(texture_struct)) = texture_field {
+                // Extract image metadata from texture
+                if let Some((w, h, fmt, level_count)) = extract_image_metadata(texture_struct) {
+                    // Look for ContentHash in texture.data
+                    if let Some(Value::Struct(data_obj)) = texture_struct.get("data") {
+                        if let Some(content_hash) = extract_content_hash_from_data(data_obj) {
+                            // Get debug name: prioritize lookup by icon guid in item_debug_names
+                            // This is the correct way for icon registries - icon.guid maps to ItemInfo.objectId
+                            let mut debug_name = None;
 
-                if let (Some(ch), Some(sr), Some(fc)) = (channels, sample_rate, frame_count) {
-                    if ch > 0 && sr > 0 && fc > 0 {
-                        content_map.insert(content_hash, ContentMetadata::Audio {
-                            channels: ch,
-                            sample_rate: sr,
-                            frame_count: fc,
+                            // First, try to look up by icon's guid or resource's $guid
+                            // ItemIconRegistry icons have "guid", BuffType/etc have "$guid"
+                            if let Some(item_guids) = item_debug_names {
+                                if let Some(Value::Guid(icon_guid)) = fields.get("guid").or_else(|| fields.get("$guid")) {
+                                    debug_name = item_guids.get(icon_guid).cloned();
+                                }
+                            }
+
+                            // Fallback to direct debug name fields if lookup didn't work
+                            if debug_name.is_none() {
+                                debug_name = fields.get("debugName")
+                                    .or_else(|| fields.get("debug_name"))
+                                    .or_else(|| texture_struct.get("debugName"))
+                                    .or_else(|| texture_struct.get("debug_name"))
+                                    .and_then(|v| v.as_string())
+                                    .map(|s| s.clone());
+                            }
+
+                            content_map.insert(content_hash, ContentMetadata::Image {
+                                width: w,
+                                height: h,
+                                format: fmt,
+                                level_count,
+                                debug_name: debug_name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Also check for icons array (ItemIconRegistryResource structure)
+            if let Some(Value::Array(icons)) = fields.get("icons") {
+                // Process each icon in the registry
+                for icon in icons {
+                    if let Value::Struct(icon_fields) = icon {
+                        // Recursively process this icon (which will handle uiTexture)
+                        scan_value_for_content(icon, Some(icon_fields), content_map, item_debug_names);
+                    }
+                }
+            }
+
+            // Check for data object with ContentHash fields
+            if let Some(Value::Struct(data_obj)) = fields.get("data") {
+                if let Some(content_hash) = extract_content_hash_from_data(data_obj) {
+                    // Try to find metadata in parent or sibling fields
+                    if let Some(parent) = parent_struct {
+                        if let Some((w, h, fmt, level_count)) = extract_image_metadata(parent) {
+                            let debug_name = parent.get("debugName")
+                                .or_else(|| parent.get("debug_name"))
+                                .and_then(|v| v.as_string())
+                                .map(|s| s.clone());
+
+                            // Only insert if not already present (to avoid overwriting entries with debug names)
+                            content_map.entry(content_hash).or_insert(ContentMetadata::Image {
+                                width: w,
+                                height: h,
+                                format: fmt,
+                                level_count,
+                                debug_name,
+                            });
+                        }
+                    }
+
+                    // Also check if the parent of this struct has the metadata
+                    if let Some((w, h, fmt, level_count)) = extract_image_metadata(fields) {
+                        let debug_name = fields.get("debugName")
+                            .or_else(|| fields.get("debug_name"))
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.clone());
+
+                        // Only insert if not already present (to avoid overwriting entries with debug names)
+                        content_map.entry(content_hash).or_insert(ContentMetadata::Image {
+                            width: w,
+                            height: h,
+                            format: fmt,
+                            level_count,
+                            debug_name,
                         });
                     }
                 }
             }
-        }
-        Value::Struct(fields) => {
-            // Scan each field, passing the struct as parent context
+
+            // Scan each field recursively
             for (_, field_value) in fields.iter() {
-                scan_value_for_content(field_value, Some(fields), content_map);
+                scan_value_for_content(field_value, Some(fields), content_map, item_debug_names);
             }
         }
         Value::Array(items) => {
             for item in items {
-                scan_value_for_content(item, None, content_map);
+                scan_value_for_content(item, None, content_map, item_debug_names);
             }
         }
         Value::Variant(variant) => {
             for (_, field_value) in variant.value.iter() {
-                scan_value_for_content(field_value, Some(&variant.value), content_map);
+                scan_value_for_content(field_value, Some(&variant.value), content_map, item_debug_names);
             }
         }
         _ => {}
@@ -1659,13 +1825,116 @@ fn pixel_format_from_u32(value: u32) -> Option<PixelFormat> {
     formats.get(value as usize).copied()
 }
 
+/// Extract texture metadata from ItemIconRegistryResource
+/// This is a simplified version that relies on the existing scan_value_for_content
+/// The registry flag will be used to filter which resources to scan
+fn extract_registry_metadata(
+    kfc_reader: &KFCReader,
+    type_registry: &TypeRegistry,
+    registry_type: &str,
+    content_map: &mut HashMap<ContentHash, ContentMetadata>,
+    item_debug_names: Option<&HashMap<Guid, String>>,
+) -> anyhow::Result<()> {
+    let file = kfc_reader.file();
+    let mut cursor = kfc_reader.new_cursor()?;
+
+    // For now, we'll use the existing scan approach but filter by registry type
+    // A more optimized version would directly parse ItemIconRegistryResource
+    // but that requires knowing the exact type structure
+    for resource_id in file.resources().keys() {
+        let type_meta = match type_registry.get_by_hash(LookupKey::Qualified(resource_id.type_hash())) {
+            Some(meta) => meta,
+            None => continue,
+        };
+
+        // Filter by registry type if specified
+        if registry_type != "all" {
+            let type_name = &type_meta.name;
+            match registry_type {
+                "icons" => {
+                    if !type_name.contains("Icon") && !type_name.contains("icon") {
+                        continue;
+                    }
+                }
+                "ui" => {
+                    if !type_name.contains("UI") && !type_name.contains("Ui") && !type_name.contains("ui") {
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut data = Vec::new();
+        if !cursor.read_resource_into(resource_id, &mut data)? {
+            continue;
+        }
+
+        if let Ok(value) = Value::from_bytes(type_registry, type_meta, &data) {
+            scan_value_for_content(&value, None, content_map, item_debug_names);
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate filename with optional debug name
+fn generate_filename(
+    hash: &ContentHash,
+    extension: &str,
+    debug_name: Option<&str>,
+    use_debug_names: bool,
+) -> String {
+    // Remove leading dot from extension if present (extension should be like "png" or ".png")
+    let ext = extension.strip_prefix('.').unwrap_or(extension);
+
+    if use_debug_names {
+        if let Some(name) = debug_name {
+            // Sanitize debug name for filesystem
+            let sanitized: String = name
+                .chars()
+                .map(|c| match c {
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                    c if c.is_control() => '_',
+                    c => c,
+                })
+                .collect();
+
+            format!("{}_{}.{}", sanitized, hash, ext)
+        } else {
+            format!("{}.{}", hash, ext)
+        }
+    } else {
+        format!("{}.{}", hash, ext)
+    }
+}
+
+/// Get output directory path based on content type and organize flag
+fn get_output_path(
+    base_dir: &Path,
+    organize: bool,
+    content_type: &str,
+    filename: &str,
+) -> PathBuf {
+    if organize && !content_type.is_empty() {
+        base_dir.join(content_type).join(filename)
+    } else {
+        base_dir.join(filename)
+    }
+}
+
 fn extract_content(
     game_dir: &Path,
     file_name: Option<&str>,
     output_dir: &Path,
     filter: String,
     convert: bool,
+    organize: bool,
+    use_debug_names: bool,
+    mipmaps: bool,
+    registry: Option<&str>,
     thread_count: u8,
+    limit: Option<usize>,
 ) -> Result<(), Error> {
     if !game_dir.exists() {
         fatal!("Game directory does not exist: {}", game_dir.display());
@@ -1731,8 +2000,6 @@ fn extract_content(
 
     // Build content metadata map if conversion is requested
     let content_metadata: HashMap<ContentHash, ContentMetadata> = if convert {
-        info!("Scanning resources for content metadata...");
-
         let type_registry = match load_type_registry(Some(game_dir), file_name, true) {
             Ok(reg) => reg,
             Err(e) => {
@@ -1746,43 +2013,145 @@ fn extract_content(
             Err(e) => fatal!("Failed to open {}: {}", file_path.display(), e)
         };
 
-        let mut content_map = HashMap::new();
-        let mut cursor = match kfc_reader.new_cursor() {
-            Ok(c) => c,
-            Err(e) => fatal!("Failed to create cursor: {}", e)
-        };
+        // Build a map of GUIDs to debug names from various resource types
+        let item_debug_names: Option<HashMap<Guid, String>> = if use_debug_names {
+            info!("Building debug name lookup from all resource types...");
+            let mut debug_map = HashMap::new();
+            let mut cursor = match kfc_reader.new_cursor() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!("Failed to create cursor for debug name lookup");
+                    kfc_reader.new_cursor().unwrap_or_else(|_| panic!("Cannot continue"))
+                }
+            };
 
-        // Scan all resources for content references
-        let resource_keys: Vec<_> = file.resources().keys().iter().cloned().collect();
-        let scan_pb = ProgressBar::new(resource_keys.len() as u64);
-        scan_pb.set_style(ProgressStyle::default_bar()
-            .template(&format!("{} Scanning... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
-            .unwrap()
-            .progress_chars("##-"));
+            let mut item_count = 0;
+            let mut buff_count = 0;
+            let mut other_count = 0;
 
-        for resource_id in &resource_keys {
-            let result: anyhow::Result<()> = (|| {
+            // Scan all resources for debug names
+            for resource_id in file.resources().keys() {
+                let type_meta = match type_registry.get_by_hash(LookupKey::Qualified(resource_id.type_hash())) {
+                    Some(meta) => meta,
+                    None => continue,
+                };
+
                 let mut data = Vec::new();
-                if !cursor.read_resource_into(resource_id, &mut data)? {
-                    return Ok(());
+                if !cursor.read_resource_into(resource_id, &mut data).unwrap_or(false) {
+                    continue;
                 }
 
-                let type_meta = type_registry.get_by_hash(LookupKey::Qualified(resource_id.type_hash()))
-                    .ok_or_else(|| anyhow::anyhow!("Type not found"))?;
-                let value = Value::from_bytes(&type_registry, type_meta, &data)?;
-                scan_value_for_content(&value, None, &mut content_map);
-                Ok(())
-            })();
+                if let Ok(value) = Value::from_bytes(&type_registry, type_meta, &data) {
+                    if let Value::Struct(fields) = &value {
+                        // ItemInfo: Use debugName field
+                        if type_meta.name.contains("ItemInfo") {
+                            if let (Some(Value::Guid(guid)), Some(debug_name)) = (
+                                fields.get("objectId").or_else(|| fields.get("guid")),
+                                fields.get("debugName").or_else(|| fields.get("debug_name"))
+                            ) {
+                                if let Some(name) = debug_name.as_string() {
+                                    debug_map.insert(*guid, name.clone());
+                                    item_count += 1;
+                                }
+                            }
+                        }
+                        // BuffType: Use resource GUID from resource_id
+                        else if type_meta.name.contains("BuffType") {
+                            let resource_guid = resource_id.guid();
+                            // Try to get a readable name from debugName if available
+                            let name = fields.get("debugName")
+                                .or_else(|| fields.get("debug_name"))
+                                .and_then(|v| v.as_string())
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|| format!("Buff_{}", resource_guid));
+                            debug_map.insert(resource_guid, name);
+                            buff_count += 1;
+                        }
+                        // Other resource types with icons (Achievement, MapMarker, etc.)
+                        else if type_meta.name.contains("Achievement")
+                            || type_meta.name.contains("MapMarker")
+                            || type_meta.name.contains("Journal")
+                            || type_meta.name.contains("Recipe") {
+                            let resource_guid = resource_id.guid();
+                            // Extract type name for prefix
+                            let type_prefix = if type_meta.name.contains("Achievement") { "Achievement" }
+                                else if type_meta.name.contains("MapMarker") { "MapMarker" }
+                                else if type_meta.name.contains("Journal") { "Journal" }
+                                else if type_meta.name.contains("Recipe") { "Recipe" }
+                                else { "Resource" };
 
-            if let Err(e) = result {
-                // Silently skip resources that can't be parsed
-                let _ = e;
+                            let name = fields.get("debugName")
+                                .or_else(|| fields.get("debug_name"))
+                                .and_then(|v| v.as_string())
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|| format!("{}_{}", type_prefix, resource_guid));
+                            debug_map.insert(resource_guid, name);
+                            other_count += 1;
+                        }
+                    }
+                }
             }
+            info!("Found {} debug names ({} items, {} buffs, {} other)",
+                debug_map.len(), item_count, buff_count, other_count);
+            Some(debug_map)
+        } else {
+            None
+        };
 
-            scan_pb.inc(1);
+        let mut content_map = HashMap::new();
+
+        // Use registry-based extraction if specified
+        if let Some(registry_type) = registry {
+            info!("Extracting metadata from {} registry...", registry_type);
+            if let Err(e) = extract_registry_metadata(&kfc_reader, &type_registry, registry_type, &mut content_map, item_debug_names.as_ref()) {
+                warn!("Registry extraction failed, falling back to full scan: {}", e);
+                // Fall through to full scan
+            } else {
+                info!("Found metadata for {} content blobs from registry", content_map.len());
+            }
         }
 
-        scan_pb.finish_and_clear();
+        // If no registry specified or registry extraction didn't find everything, do full scan
+        if registry.is_none() || content_map.is_empty() {
+            info!("Scanning all resources for content metadata...");
+
+            let mut cursor = match kfc_reader.new_cursor() {
+                Ok(c) => c,
+                Err(e) => fatal!("Failed to create cursor: {}", e)
+            };
+
+            // Scan all resources for content references
+            let resource_keys: Vec<_> = file.resources().keys().iter().cloned().collect();
+            let scan_pb = ProgressBar::new(resource_keys.len() as u64);
+            scan_pb.set_style(ProgressStyle::default_bar()
+                .template(&format!("{} Scanning... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
+                .unwrap()
+                .progress_chars("##-"));
+
+            for resource_id in &resource_keys {
+                let result: anyhow::Result<()> = (|| {
+                    let mut data = Vec::new();
+                    if !cursor.read_resource_into(resource_id, &mut data)? {
+                        return Ok(());
+                    }
+
+                    let type_meta = type_registry.get_by_hash(LookupKey::Qualified(resource_id.type_hash()))
+                        .ok_or_else(|| anyhow::anyhow!("Type not found"))?;
+                    let value = Value::from_bytes(&type_registry, type_meta, &data)?;
+                    scan_value_for_content(&value, None, &mut content_map, item_debug_names.as_ref());
+                    Ok(())
+                })();
+
+                if let Err(e) = result {
+                    // Silently skip resources that can't be parsed
+                    let _ = e;
+                }
+
+                scan_pb.inc(1);
+            }
+
+            scan_pb.finish_and_clear();
+        }
 
         info!("Found metadata for {} content blobs ({} images, {} audio)",
             content_map.len(),
@@ -1795,21 +2164,41 @@ fn extract_content(
         HashMap::new()
     };
 
+    // Filter hashes to only those with metadata when using registry
+    if registry.is_some() && !content_metadata.is_empty() {
+        let metadata_hashes: HashSet<ContentHash> = content_metadata.keys().cloned().collect();
+        let original_count = hashes.len();
+        hashes = hashes.intersection(&metadata_hashes).cloned().collect();
+        info!("Filtered to {} content blobs with metadata (from {} total)", hashes.len(), original_count);
+    }
+
     let kfc_reader = match KFCReader::new(game_dir, &file_name_str) {
         Ok(reader) => reader,
         Err(e) => fatal!("Failed to open {}: {}", file_path.display(), e)
     };
 
-    info!("Extracting {} content blobs to {}", hashes.len(), output_dir.display());
+    let total_hashes = hashes.len();
+    info!("Extracting {} content blobs{} to {}",
+        if limit.is_some() { std::cmp::min(total_hashes, limit.unwrap()) } else { total_hashes },
+        if let Some(l) = limit { format!(" (limited from {})", total_hashes) } else { String::new() },
+        output_dir.display()
+    );
 
-    let pb = ProgressBar::new(hashes.len() as u64);
+    let pb = ProgressBar::new(if let Some(l) = limit { std::cmp::min(total_hashes, l) as u64 } else { total_hashes as u64 });
     pb.set_style(ProgressStyle::default_bar()
         .template(&format!("{} Extracting... [{{bar:40}}] {{pos:>7}}/{{len:7}} {{msg}}", "info:".blue().bold()))
         .unwrap()
         .progress_chars("##-"));
 
-    let total = hashes.len() as u32;
-    let pending_hashes = Mutex::new(hashes.into_iter().collect::<Vec<_>>());
+    // Apply limit if specified
+    let hashes_to_extract: Vec<_> = if let Some(limit_count) = limit {
+        hashes.into_iter().take(limit_count).collect()
+    } else {
+        hashes.into_iter().collect()
+    };
+
+    let total = hashes_to_extract.len() as u32;
+    let pending_hashes = Mutex::new(hashes_to_extract);
     let failed_extracts = AtomicU32::new(0);
     let start = std::time::Instant::now();
 
@@ -1823,6 +2212,9 @@ fn extract_content(
             let pb = &pb;
             let kfc_reader = &kfc_reader;
             let content_metadata = &content_metadata;
+            let organize = organize;
+            let use_debug_names = use_debug_names;
+            let mipmaps = mipmaps;
 
             let handle = s.spawn(move || {
                 let mut reader = match kfc_reader.new_cursor() {
@@ -1852,23 +2244,120 @@ fn extract_content(
                             anyhow::bail!("Content not found");
                         }
 
+                        // Strip wrapper header if present
+                        let raw_data = strip_content_wrapper(&data);
+
                         // Determine output format based on metadata
-                        let (file_name, output_data) = if convert {
+                        if convert {
                             if let Some(metadata) = content_metadata.get(&hash) {
                                 match metadata {
-                                    ContentMetadata::Image { width, height, format } => {
-                                        // Decode GPU format to RGBA8
-                                        let w = *width as usize;
-                                        let h = *height as usize;
-                                        let mut rgba = vec![0u8; w * h * 4];
+                                    ContentMetadata::Image { width, height, format, level_count, debug_name } => {
+                                        let base_w = *width as usize;
+                                        let base_h = *height as usize;
+                                        let levels_to_extract = if mipmaps { *level_count } else { 1 };
 
-                                        if let Err(e) = decode_image(*format, w, h, &data, &mut rgba) {
-                                            // Fall back to raw binary if decoding fails
+                                        // Calculate total size needed for all mipmap levels
+                                        let mut total_size = 0;
+                                        for level in 0..levels_to_extract {
+                                            let w = (base_w >> level).max(1);
+                                            let h = (base_h >> level).max(1);
+                                            total_size += size_of_format(*format, w, h);
+                                        }
+
+                                        // Validate data size before attempting to decode
+                                        if raw_data.is_empty() {
                                             pb.suspend(|| {
-                                                warn!("Failed to decode image {}: {}, saving as raw", hash, e);
+                                                warn!("Empty data for image {}, saving to failed/", hash);
                                             });
-                                            (format!("{}.bin", hash), data)
-                                        } else {
+                                            let content_type = if organize { "failed" } else { "" };
+                                            let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                            std::fs::create_dir_all(path.parent().unwrap())?;
+                                            let mut file = File::create(&path)?;
+                                            file.write_all(&data)?;
+                                            return Ok(());
+                                        }
+
+                                        if raw_data.len() < total_size {
+                                            pb.suspend(|| {
+                                                warn!("Insufficient data for mipmaps {}: need {}, have {}, extracting single level", hash, total_size, raw_data.len());
+                                            });
+                                            // Fall back to single level
+                                        }
+
+                                        let mut offset = 0;
+                                        let mut extracted_any = false;
+                                        for level in 0..levels_to_extract {
+                                            let w = (base_w >> level).max(1);
+                                            let h = (base_h >> level).max(1);
+                                            let level_size = size_of_format(*format, w, h);
+
+                                            // Bounds check before slicing
+                                            if offset + level_size > raw_data.len() {
+                                                if level == 0 {
+                                                    // Can't even extract base level
+                                                    pb.suspend(|| {
+                                                        warn!("Insufficient data for base level {}: need {}, have {}, saving to failed/", hash, level_size, raw_data.len());
+                                                    });
+                                                    let content_type = if organize { "failed" } else { "" };
+                                                    let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                                    let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                                    std::fs::create_dir_all(path.parent().unwrap())?;
+                                                    let mut file = File::create(&path)?;
+                                                    file.write_all(&data)?;
+                                                    return Ok(());
+                                                }
+                                                break;
+                                            }
+
+                                            let level_data = &raw_data[offset..offset + level_size];
+                                            let mut rgba = vec![0u8; w * h * 4];
+
+                                            // Use catch_unwind to handle panics from block compression library
+                                            let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                decode_image(*format, w, h, level_data, &mut rgba)
+                                            }));
+
+                                            match decode_result {
+                                                Ok(Ok(())) => {
+                                                    // Decode succeeded
+                                                }
+                                                Ok(Err(e)) => {
+                                                    if level == 0 {
+                                                        // Only warn for base level
+                                                        pb.suspend(|| {
+                                                            warn!("Failed to decode image {} level {}: {}, saving to failed/", hash, level, e);
+                                                        });
+                                                        let content_type = if organize { "failed" } else { "" };
+                                                        let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                                        let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                                        std::fs::create_dir_all(path.parent().unwrap())?;
+                                                        let mut file = File::create(&path)?;
+                                                        file.write_all(&data)?;
+                                                        return Ok(());
+                                                    }
+                                                    offset += level_size;
+                                                    continue;
+                                                }
+                                                Err(_) => {
+                                                    // Panic occurred during decode
+                                                    if level == 0 {
+                                                        pb.suspend(|| {
+                                                            warn!("Panic during decode of image {} level {}, saving to failed/", hash, level);
+                                                        });
+                                                        let content_type = if organize { "failed" } else { "" };
+                                                        let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                                        let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                                        std::fs::create_dir_all(path.parent().unwrap())?;
+                                                        let mut file = File::create(&path)?;
+                                                        file.write_all(&data)?;
+                                                        return Ok(());
+                                                    }
+                                                    offset += level_size;
+                                                    continue;
+                                                }
+                                            }
+
                                             // Encode as PNG
                                             let mut png_data = Vec::new();
                                             {
@@ -1878,38 +2367,92 @@ fn extract_content(
                                                 let mut writer = encoder.write_header()?;
                                                 writer.write_image_data(&rgba)?;
                                             }
-                                            (format!("{}.png", hash), png_data)
+
+                                            // Generate filename with level suffix if multiple mipmaps
+                                            let extension = if levels_to_extract > 1 {
+                                                format!("_mip{}.png", level)
+                                            } else {
+                                                ".png".to_string()
+                                            };
+
+                                            let file_name = generate_filename(&hash, &extension, debug_name.as_deref(), use_debug_names);
+                                            // Determine content type based on dimensions (icons are typically small square textures)
+                                            let content_type = if organize {
+                                                if base_w <= 512 && base_h <= 512 && base_w == base_h {
+                                                    "icons"
+                                                } else {
+                                                    "textures"
+                                                }
+                                            } else {
+                                                ""
+                                            };
+                                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                            std::fs::create_dir_all(path.parent().unwrap())?;
+                                            let mut file = File::create(&path)?;
+                                            file.write_all(&png_data)?;
+
+                                            extracted_any = true;
+                                            offset += level_size;
+                                        }
+
+                                        if !extracted_any {
+                                            // No mipmaps were successfully extracted, save to failed folder
+                                            pb.suspend(|| {
+                                                warn!("No mipmaps extracted for {}, saving to failed/", hash);
+                                            });
+                                            let content_type = if organize { "failed" } else { "" };
+                                            let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                            std::fs::create_dir_all(path.parent().unwrap())?;
+                                            let mut file = File::create(&path)?;
+                                            file.write_all(&data)?;
                                         }
                                     }
-                                    ContentMetadata::Audio { channels, sample_rate, frame_count } => {
+                                    ContentMetadata::Audio { channels, sample_rate, frame_count, debug_name } => {
                                         // Convert to WAV
                                         let mut wav_data = Vec::new();
-                                        let cursor = Cursor::new(&data);
+                                        let cursor = Cursor::new(raw_data);
                                         let wav_cursor = Cursor::new(&mut wav_data);
 
                                         if let Err(e) = deserialize_audio(cursor, wav_cursor, *channels, *sample_rate, *frame_count) {
                                             // Fall back to raw binary if conversion fails
                                             pb.suspend(|| {
-                                                warn!("Failed to convert audio {}: {}, saving as raw", hash, e);
+                                                warn!("Failed to convert audio {}: {}, saving to failed/", hash, e);
                                             });
-                                            (format!("{}.bin", hash), data)
+                                            let content_type = if organize { "failed" } else { "" };
+                                            let file_name = generate_filename(&hash, "bin", debug_name.as_deref(), use_debug_names);
+                                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                            std::fs::create_dir_all(path.parent().unwrap())?;
+                                            let mut file = File::create(&path)?;
+                                            file.write_all(&data)?;
                                         } else {
-                                            (format!("{}.wav", hash), wav_data)
+                                            let content_type = if organize { "audio" } else { "" };
+                                            let file_name = generate_filename(&hash, "wav", debug_name.as_deref(), use_debug_names);
+                                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                            std::fs::create_dir_all(path.parent().unwrap())?;
+                                            let mut file = File::create(&path)?;
+                                            file.write_all(&wav_data)?;
                                         }
                                     }
                                 }
                             } else {
                                 // No metadata, save as raw binary
-                                (format!("{}.bin", hash), data)
+                                let content_type = if organize { "unknown" } else { "" };
+                                let file_name = generate_filename(&hash, "bin", None, use_debug_names);
+                                let path = get_output_path(output_dir, organize, content_type, &file_name);
+                                std::fs::create_dir_all(path.parent().unwrap())?;
+                                let mut file = File::create(&path)?;
+                                file.write_all(&data)?;
                             }
                         } else {
                             // No conversion, save as raw binary
-                            (format!("{}.bin", hash), data)
-                        };
-
-                        let path = output_dir.join(&file_name);
-                        let mut file = File::create(&path)?;
-                        file.write_all(&output_data)?;
+                            let content_type = if organize { "unknown" } else { "" };
+                            let file_name = generate_filename(&hash, "bin", None, use_debug_names);
+                            let path = get_output_path(output_dir, organize, content_type, &file_name);
+                            std::fs::create_dir_all(path.parent().unwrap())?;
+                            let mut file = File::create(&path)?;
+                            file.write_all(&data)?;
+                        }
 
                         Ok(())
                     })();
@@ -1933,7 +2476,10 @@ fn extract_content(
         }
 
         for handle in handles {
-            handle.join().unwrap()
+            if let Err(_) = handle.join() {
+                // Thread panicked - errors are already logged by the panic handler
+                // The failed_extracts counter will be updated by error handling in the thread
+            }
         }
     });
 

@@ -104,6 +104,27 @@ pub enum Commands {
         /// This requires scanning resources to determine content types
         #[arg(short, long, default_value = "false")]
         convert: bool,
+
+        /// Organize output by content type (icons/, textures/, audio/, unknown/)
+        #[arg(long, default_value = "false")]
+        organize: bool,
+
+        /// Include debug names in filenames when available
+        #[arg(long, default_value = "false")]
+        use_debug_names: bool,
+
+        /// Extract all mipmap levels (not just level 0)
+        #[arg(long, default_value = "false")]
+        mipmaps: bool,
+
+        /// Fast extraction from specific registry (icons, ui, all)
+        /// When specified, skips full resource scan and uses registry directly
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Limit number of content blobs to extract (for testing)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Import content blobs back into KFC files
